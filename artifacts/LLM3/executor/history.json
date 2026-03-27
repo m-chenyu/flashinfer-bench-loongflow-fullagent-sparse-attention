@@ -1,0 +1,29 @@
+[
+  {
+    "round": 0,
+    "candidates": [
+      {
+        "round_idx": 0,
+        "candidate_idx": 0,
+        "random_idx": "_13e",
+        "solution_file_path": "output/038d3baa-883f-4de6-b18f-44e92baf71dd/20/gpt-5.4/executor/0_0/solution_13e.py",
+        "evaluation_file_path": "output/038d3baa-883f-4de6-b18f-44e92baf71dd/20/gpt-5.4/executor/0_0/evaluation_13e.json",
+        "score": 4.397657682714005,
+        "reason": "{\n  \"status\": \"success\",\n  \"summary\": \"Optimization successful! Speedup: 43.98x (ref: 2.438ms, kernel: 0.065ms)\",\n  \"score\": 4.397657682714005,\n  \"metrics\": {\n    \"correctness\": 1.0,\n    \"speedup\": 43.97657682714005,\n    \"exec_time_ms\": 0.0654155129323835,\n    \"baseline_time_ms\": 2.4380647016608195,\n    \"compile_time\": 0.0,\n    \"eval_time\": 50.98575305938721\n  },\n  \"artifacts\": {\n    \"eval_backend\": \"modal+flashinfer-bench\",\n    \"task_id\": \"dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64\",\n    \"execution_time\": \"50.99s\",\n    \"kernel_latency_ms\": \"0.065ms\",\n    \"reference_latency_ms\": \"2.438ms\",\n    \"speedup\": \"43.98x\",\n    \"bench_stats\": {\n      \"reference_latency_ms\": 2.4380647016608195,\n      \"max_relative_error\": 0.0826224759221077,\n      \"max_absolute_error\": 0.0078125,\n      \"total_workloads\": 23\n    },\n    \"correctness_check\": \"Passed\"\n  }\n}",
+        "source": "disk",
+        "model_name": ""
+      },
+      {
+        "round_idx": 0,
+        "candidate_idx": 0,
+        "random_idx": "_e40",
+        "solution_file_path": "output/038d3baa-883f-4de6-b18f-44e92baf71dd/20/gpt-5.4/executor/0_0/solution_e40.py",
+        "evaluation_file_path": "output/038d3baa-883f-4de6-b18f-44e92baf71dd/20/gpt-5.4/executor/0_0/evaluation_e40.json",
+        "score": 0.0,
+        "reason": "{\n  \"status\": \"validation_failed\",\n  \"summary\": \"Validation failed: INCORRECT_NUMERICAL: \",\n  \"score\": 0.0,\n  \"metrics\": {\n    \"correctness\": 0.0,\n    \"speedup\": 0.0,\n    \"exec_time_ms\": 0.0,\n    \"baseline_time_ms\": 0.0,\n    \"compile_time\": 0.0,\n    \"eval_time\": 57.69498372077942\n  },\n  \"artifacts\": {\n    \"eval_backend\": \"modal+flashinfer-bench\",\n    \"task_id\": \"dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64\",\n    \"execution_time\": \"57.69s\",\n    \"error\": \"INCORRECT_NUMERICAL: \"\n  }\n}",
+        "source": "disk",
+        "model_name": ""
+      }
+    ]
+  }
+]

@@ -1,0 +1,150 @@
+# Role
+You are a world-class expert in high-performance computing, specializing in **TileLang** (Tile Language), Triton, and TVM-based optimization. Your expertise includes writing custom high-performance kernels, optimizing memory access patterns, and leveraging low-level hardware features like Shared Memory, Async Copy, and Tensor Cores through Tile-level abstractions.
+
+# Task
+You will be given a Python code snippet defining a PyTorch model (`class Model`). Your task is to create a highly optimized **TileLang** kernel to accelerate the model's `forward` pass. You will implement a new model, `ModelNew`, which replaces the original `forward` logic with a single, fused TileLang kernel compiled via `T.jit.trace`.
+
+# Input Format
+You will receive a Python code block containing:
+1. `class Model(nn.Module)`: The model to be accelerated.
+2. `get_init_inputs()`: A function that returns the arguments for `Model.__init__`.
+3. `get_inputs()`: A function that returns the input tensor for `Model.forward`.
+4. (Optional) A reference implementation or a description of the model's mathematical logic.
+
+# Core Constraints & Requirements
+1. **API and State Preservation**:
+    * The new model must be named `ModelNew`.
+    * `ModelNew.__init__` and `ModelNew.forward` must have the exact same signatures as `Model`.
+    * All submodule names (e.g., `self.linear`, `self.conv`) must be identical.
+    * The `state_dict` of `ModelNew` must have the same keys and structure as `Model`.
+    * **Crucially**: Do NOT create any new `nn.Parameter`s or buffers in `ModelNew.__init__`. The new model should reuse the original submodules and their parameters, which will be passed directly to the TileLang kernel.
+
+2. **TileLang Implementation**:
+    * Implement the entire `forward` pass logic within a **single TileLang kernel** (decorated with `@T.prim_func`).
+    * Use `tilelang` (imported as `import tilelang as T`).
+    * Use `T.jit.trace` to compile and load the kernel for use in PyTorch.
+    * The kernel launch configuration (`T.grid`) must be calculated dynamically based on input tensor shapes.
+
+3. **Implementation Restrictions (Strictly Enforced)**:
+    * **No Black Boxes**: You must implement the core mathematical operations (e.g., matrix multiplication, normalization, activation) yourself using TileLang primitives (e.g., `T.parallel`, `T.reduce`, `T.dot`).
+    * **No PyTorch/NN Calls**: Do NOT call `torch.nn.functional` functions, `torch` operators, or the `forward` method of any submodule inside the kernel logic.
+    * **Direct Parameter Access**: Pass parameters and buffers (e.g., `self.linear.weight`, `self.linear.bias`) as buffers to your TileLang kernel.
+
+# Mandatory Innovation Dimensions (Architectural-Level Changes)
+Your solution must demonstrate a **substantial architectural or performance improvement** over a naive implementation. You must innovate in at least **one** of the following dimensions:
+
+1. **Algorithm & Parallelization Strategy**:
+    * **Fusion**: Fuse multiple operations (e.g., LayerNorm + Activation + Bias Add) into one kernel to eliminate intermediate tensor writes and reads from global memory.
+    * **Tile-level Reduction**: Implement efficient reduction strategies using TileLang's `T.reduce` or hierarchical reduction to avoid atomic serialization.
+    * **Mapping**: Optimize the `T.grid` and `T.block` mapping to maximize occupancy and load balancing.
+
+2. **Memory Access & Caching**:
+    * **Coalescing & Vectorization**: Redesign access patterns to ensure vectorized loads (e.g., 128-bit) from Global Memory.
+    * **Shared Memory (SRAM)**: Use `T.alloc_shared` as a user-managed cache for weights or intermediate tiles to drastically reduce HBM bandwidth pressure.
+    * **Bank Conflict Resolution**: Design Tile shapes and layouts to avoid shared memory bank conflicts.
+
+3. **Hardware-Specific Optimization**:
+    * **Pipelining**: Use `T.copy` with asynchronous features or double-buffering to overlap computation with memory transfers.
+    * **Tensor Cores**: Structure your kernel to leverage Tensor Cores (using `T.dot` or `T.gemm` with appropriate Tile sizes like 16x16x16) for a massive performance boost.
+
+4. **Control Flow & Code Structure**:
+    * **Loop Unrolling**: Aggressively unroll inner loops using `T.unroll`.
+    * **Divergence Reduction**: Refactor data layout to minimize thread divergence within a tile.
+
+# Output Format
+Provide **only a single Python code block** containing the complete, runnable implementation of `ModelNew`. The code should include:
+- All necessary imports.
+- The `@T.prim_func` definition with TileLang IR.
+- The `T.jit.trace` compilation call.
+- The full definition of the `ModelNew` class.
+
+# Final Instruction
+Think deeply about the problem. Analyze the reference implementation for bottlenecks (memory-bound vs. compute-bound). Your goal is to write a *high-performance* TileLang kernel that demonstrates expert-level understanding of GPU memory hierarchy and tiling. Prioritize performance without sacrificing correctness.
+
+
+Below is an example. You can refer to the ModelNew format in this example. Your question code is in the initial-file :
+
+===== Example Start =====
+
+Given PyTorch model:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self, alpha: float) -> None:
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, a, b):
+        return self.alpha * a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return [2.0]
+```
+
+You should respond with:
+
+[Your thinking process]
+
+Then the final answer:
+
+```python
+import torch
+import torch.nn as nn
+import tilelang as T
+from tilelang import tvm
+# Define the TileLang kernel
+@T.prim_func
+def elementwise_add_kernel(
+    a: T.Buffer((1, 128), "float32"),
+    b: T.Buffer((1, 128), "float32"),
+    out: T.Buffer((1, 128), "float32"),
+    alpha: T.float32,
+):
+    # Specify the grid: divide the 128 elements into tiles (e.g., tile_size=128 for simplicity)
+    with T.grid(1):
+        with T.block(128):
+            # Define the loop for the block
+            for i in T.parallel(128):
+                # Core mathematical logic implemented manually
+                out[0, i] = alpha * a[0, i] + b[0, i]
+
+# JIT Compile the kernel for PyTorch integration
+# We specify the input shapes and types for tracing
+input_a = torch.randn(1, 128).cuda()
+input_b = torch.randn(1, 128).cuda()
+output_out = torch.empty_like(input_a)
+
+kernel_jit = T.jit.trace(
+    elementwise_add_kernel,
+    inputs=[input_a, input_b, output_out, 2.0],
+    out_idx=[2] # Index of the output buffer in the prim_func arguments
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, alpha: float) -> None:
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, a, b):
+        # TileLang JIT kernels are typically called with (input1, input2, ..., output, scalar_params)
+        # Depending on the specific TileLang runtime version, the output can be pre-allocated
+        out = torch.empty_like(a)
+        kernel_jit(a, b, out, self.alpha)
+        return out
+```
+
+===== Example End =====

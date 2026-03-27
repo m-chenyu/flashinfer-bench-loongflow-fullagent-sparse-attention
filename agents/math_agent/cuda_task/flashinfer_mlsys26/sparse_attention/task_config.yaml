@@ -1,0 +1,150 @@
+# Global directory configuration
+workspace_path: "./output"
+
+# Global LLM configuration
+llm_config:
+  # Fill in your own endpoint and API key locally before running.
+
+  url: "https://your-llm-endpoint/v1"
+  api_key: "YOUR_API_KEY"
+  model: "openai/claude-sonnet-4-6"
+
+
+  temperature: 0.9
+  context_length: 128000
+  max_tokens: 32768
+  timeout: 1200
+
+# ------------------------------------------------------------------------------
+# Define all available components
+# ------------------------------------------------------------------------------
+
+planners:
+  evolve_planner:
+    react_max_steps: 5
+
+executors:
+  evolve_executor_react:
+    parallel_candidates: 1
+    max_rounds: 3
+    react_max_steps: 10
+
+  evolve_executor_chat:
+    max_rounds: 3
+
+  evolve_executor_fuse:
+    max_rounds: 3
+    react_max_steps: 10
+    score_threshold: 0.99
+
+summarizers:
+  evolve_summary:
+    react_max_steps: 5
+
+# ------------------------------------------------------------------------------
+# Define main evolution process configuration
+# ------------------------------------------------------------------------------
+evolve:
+  task: |
+    # Role
+    You are a world-class expert in high-performance GPU kernel programming,
+    specializing in CUDA C/C++. Your goal is to write optimized CUDA kernels
+    that maximize speedup over a reference implementation.
+
+    # Task Format
+    The initial input is a **JSON task definition** (not Python code). It contains:
+    - `name`: task identifier
+    - `axes`: dimension parameters (batch_size is variable, others may be const)
+    - `inputs`: input tensor specifications (shape, dtype, description)
+    - `outputs`: expected output specifications
+    - `constraints`: dimension relationships
+    - `reference`: a correct but unoptimized Python `run()` function
+
+    # What You Must Produce
+    A single Python code block defining a `run()` function that uses
+    `torch.utils.cpp_extension.load_inline` to compile a CUDA kernel:
+    ```python
+    import torch
+    from torch.utils.cpp_extension import load_inline
+
+    cuda_source = r"""..."""  # CUDA kernel + C++ wrapper
+    cpp_source = r"""..."""   # Function declarations
+    module = load_inline(name="...", cpp_sources=cpp_source,
+                         cuda_sources=cuda_source, functions=[...],
+                         extra_cuda_cflags=["-O3", "--use_fast_math"])
+
+    def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
+        # Call CUDA wrapper(s) and return the required 2-tuple
+        output, lse = module.my_op(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale)
+        return output, lse  # MUST return (output, lse)
+    ```
+
+    This `run()` function is the entry point for evaluation. It must:
+    - Accept the same positional arguments as the reference
+    - Return outputs with identical shapes and dtypes
+    - Be numerically correct (rtol=1e-2, atol=1e-2)
+
+    # Optimization Priorities
+    1. **Fusion** - combine multiple ops into one CUDA kernel
+    2. **Memory coalescing** - ensure aligned, contiguous access
+    3. **Shared memory tiling** - data reuse across threads
+    4. **Precision** - accumulate in float32 for bfloat16 inputs
+    5. **Occupancy** - maximize GPU utilization
+
+    # Important Notes
+    - The reference code is in the JSON's `"reference"` field.
+    - Study the reference carefully to understand the mathematical operation
+      before optimizing.
+    - Use CUDA via `torch.utils.cpp_extension.load_inline`.
+
+  # Component selection
+  planner_name: "evolve_planner"
+  executor_name: "evolve_executor_fuse"
+  summary_name: "evolve_summary"
+
+  # Core parameters
+  max_iterations: 30
+  target_score: 100.0
+  concurrency: 1
+
+  # Multi-model competitive PES mode:
+  # 3 models run full PES cycles in parallel per iteration,
+  # best-scoring result becomes the shared parent for the next iteration.
+  multi_llm_configs:
+    - url: "https://your-llm-endpoint/v1"
+      api_key: "YOUR_API_KEY"
+      model: "openai/gpt-5.4"
+      temperature: 0.9
+      context_length: 128000
+      max_tokens: 32768
+      timeout: 1200
+    - url: "https://your-llm-endpoint/v1"
+      api_key: "YOUR_API_KEY"
+      model: "openai/claude-sonnet-4-6"
+      temperature: 0.9
+      context_length: 128000
+      max_tokens: 32768
+      timeout: 1200
+    - url: "https://your-llm-endpoint/v1"
+      api_key: "YOUR_API_KEY"
+      model: "openai/gemini-3.1-pro-preview"
+      temperature: 0.9
+      context_length: 128000
+      max_tokens: 32768
+      timeout: 1200
+
+  # Skip evaluation of the JSON initial file (it's a task definition, not code)
+  initial_score: 0.0
+  initial_evaluation: "Initial file is a JSON task definition. No kernel to evaluate yet."
+
+  # Evaluator configuration
+  evaluator:
+    timeout: 1200
+
+  # Database configurations
+  database:
+    storage_type: "in_memory"
+    num_islands: 1
+    population_size: 100
+    checkpoint_interval: 1
+    sampling_weight_power: 2

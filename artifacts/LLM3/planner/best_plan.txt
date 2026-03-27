@@ -1,0 +1,319 @@
+### Final Child Solution Generation Plan
+
+**Objective:** Improve the parent CUDA implementation for batched native sparse attention by preserving exact reference semantics while reducing shared-memory pressure, synchronization cost, and bf16 conversion overhead. The child should keep correctness comfortably above the required threshold and aim for lower latency than the current 0.065 ms kernel.
+
+**Selected Outline:** Warp-specialized streaming softmax kernel with hierarchical exact reduction.
+
+**Rationale for Selection:**
+1. It is the most algorithmically robust: no temporary score tensor, no data-dependent page-grouping dependency, no stochastic component, and no reliance on lucky sparsity patterns.
+2. It preserves the mathematically exact online softmax recurrence, so validity is guaranteed by construction.
+3. It directly attacks the parent’s likely bottleneck: excessive shared-memory use (`smem_acc[8][512]`) and heavy block-wide synchronization for merging warp accumulators.
+4. It is code-ready inside `torch.utils.cpp_extension.load_inline` and fits the task’s requirement of a fused CUDA kernel.
+
+---
+
+## Phase 1: Mathematical Definition
+
+### 1. Exact operation to implement
+For each token `t` and query head `h`, define the valid sparse key set:
+- Flat sparse index: `idx_k = sparse_indices[t, k]`, `k in [0, 2047]`
+- Validity mask: `v_k = 1[idx_k >= 0]`
+
+For valid entries:
+- `K_nope(k) = ckv_cache[idx_k, :]` with shape `[512]`
+- `K_pe(k)   = kpe_cache[idx_k, :]` with shape `[64]`
+- `Q_nope    = q_nope[t, h, :]` with shape `[512]`
+- `Q_pe      = q_pe[t, h, :]` with shape `[64]`
+
+The exact score is:
+- `score_k = sm_scale * (dot(Q_nope, K_nope(k)) + dot(Q_pe, K_pe(k)))`
+
+The required output is:
+- `p_k = exp(score_k) / sum_j exp(score_j)` over valid keys only
+- `output[t, h, :] = sum_k p_k * K_nope(k)`
+- `lse[t, h] = log2(sum_k exp(score_k))`
+
+Because the result requires base-2 log-sum-exp, define:
+- `s_k = score_k * log2(e)`
+Then:
+- `lse[t, h] = log2(sum_k 2^(s_k))`
+
+### 2. Variables (X)
+Define the kernel state for one `(token, head)` block:
+- `X_query = {Q_nope[d], Q_pe[p]}`
+- `X_sparse = {idx_k}`
+- `X_warp_state[w] = {m_w, l_w, a_w[r, d_sub]}` for warp `w`
+  - `m_w`: local max in base-2 score space
+  - `l_w`: local sum of `2^(s_k - m_w)`
+  - `a_w[d]`: local weighted sum of values in fp32
+- `X_block = {m_blk, l_blk, a_blk[d]}` after exact merge across warps
+
+### 3. Constraints (C)
+Hard constraints that must always be satisfied:
+1. **Semantic correctness**: invalid indices (`-1`) must contribute exactly zero mass and must never trigger cache loads.
+2. **Shape correctness**: output `[num_tokens, 16, 512]`, lse `[num_tokens, 16]`.
+3. **Dtype correctness**: output bf16, lse fp32.
+4. **Numerical stability**: all reductions must use fp32 accumulators.
+5. **Memory safety**: every global memory read from `ckv_cache`/`kpe_cache` is guarded by `idx >= 0`.
+6. **Exact reduction law**: local and global merges must use the same online-softmax recurrence so the final result is mathematically equivalent to a full reduction over all valid keys.
+
+### 4. Objective function `f(X)`
+Minimize end-to-end kernel latency:
+- `f(X) = launch_overhead + global_memory_time + shared_memory_time + synchronization_time + conversion_time`
+subject to all correctness constraints above.
+
+The design priority is therefore:
+1. Reduce shared-memory footprint.
+2. Keep query fragments resident in registers.
+3. Minimize global reads that are not reused.
+4. Reduce full-block barriers.
+
+---
+
+## Phase 2: The Optimization Loop
+
+This phase describes the search process for the child implementation. There is no randomness here, so no multi-start loop is needed.
+
+### Step 1: Keep the parent’s good structure
+Retain the proven high-level decomposition:
+- One CUDA block per `(token, head)`.
+- `blockDim.x = 256` = 8 warps.
+- Each warp handles a disjoint chunk of the 2048 sparse keys.
+- Use a single fused kernel that computes both `output` and `lse`.
+
+This preserves the parent’s strong baseline and avoids risky algorithm changes.
+
+### Step 2: Replace the expensive block merge layout
+The parent writes a full `8 x 512` fp32 accumulator array into shared memory before merge. The child should instead use a **two-level reduction with register blocking**:
+- Each lane owns exactly 2 output dimensions in the final store path.
+- For warp-local work, each lane accumulates only the dimensions it is responsible for.
+- Merge across warps using a compact shared-memory layout:
+  - store `m_w` and `l_w` for each warp in shared memory,
+  - store only the lane-owned output partials in shared memory, not a fully expanded `8 x 512` matrix if avoidable.
+
+Concretely, Executor should try this mapping:
+- lane `i` owns output dims `2*i` and `2*i+1`
+- each warp computes weighted sums only for these lane-owned dims while still participating in full score computation.
+
+This changes the reduction structure from “all threads materialize a full 512-d vector” to “all threads materialize only their lane-owned final slice”, which should lower shared-memory traffic substantially.
+
+### Step 3: Rework score computation for better register use
+The parent converts two `float4` chunks of bf16 cache values into 16 fp32 numbers per lane per key. Keep the same idea but make the schedule more explicit:
+- Preload query fragments into registers once:
+  - each lane holds 16 `q_nope` values and 2 `q_pe` values.
+- For every key:
+  - load the corresponding 16 `k_nope` values and 2 `k_pe` values for that lane,
+  - compute lane-local partial dot,
+  - reduce within the warp using `__shfl_xor_sync`.
+
+The child should maintain this exact warp-dot solver because it is mathematically clean and likely already near optimal for the score path.
+
+### Step 4: Use exact online softmax as the reduction solver
+For each valid score `s`, update local warp state with the exact recurrence:
+- `m_new = max(m, s)`
+- `alpha = 2^(m - m_new)`
+- `beta  = 2^(s - m_new)`
+- `l     = l * alpha + beta`
+- `a[d]  = a[d] * alpha + beta * value[d]`
+- `m     = m_new`
+
+Then merge warp states into a block state using the same exact formula:
+- `m_blk = max_w m_w`
+- `l_blk = sum_w l_w * 2^(m_w - m_blk)`
+- `a_blk[d] = sum_w a_w[d] * 2^(m_w - m_blk)`
+
+This is the central mathematical solver and guarantees equivalence to the reference reduction order up to fp32 rounding.
+
+### Step 5: Test two deterministic implementation variants
+Executor should generate the child around one of these two deterministic variants, preferring the first if code complexity stays manageable:
+
+#### Variant A: Compact shared-memory merge
+- Each warp keeps local accumulators in registers for its lane-owned 2 output dims.
+- Shared memory stores:
+  - `m_w[8]`, `l_w[8]`
+  - `partial_out[8][32][2]` or flattened equivalent
+- Thread `tid` merges the 8 warp partials for its own 2 output dims.
+- This is the cleanest likely improvement over the parent.
+
+#### Variant B: Warp-pair merge
+- First merge warps in pairs using shared memory or warp-group logic.
+- Then merge the 4 pair-states to 2, then to 1.
+- Reduces fan-in and can cut some shared-memory bandwidth.
+- More complex, so only choose if implementation stays stable.
+
+### Step 6: Keep launch/configuration conservative
+Do not introduce aggressive architecture-specific features unless code remains portable:
+- No hardcoded `-arch`/`-gencode`.
+- No Triton.
+- Avoid Blackwell/Hopper-only instructions unless guarded and optional.
+- Keep `extra_cuda_cflags=["-O3", "--use_fast_math"]`.
+
+This keeps compilation robust under the benchmark harness.
+
+---
+
+## Phase 3: The "Safety Valve" (CRITICAL)
+
+This phase is the deterministic validity-enforcement layer. It is mandatory because performance gains are useless if the kernel crashes or silently miscomputes.
+
+### Safety Valve 1: Strict input normalization in Python wrapper
+Before launch, enforce:
+- `q_nope = q_nope.contiguous()`
+- `q_pe = q_pe.contiguous()`
+- `ckv_cache = ckv_cache.contiguous()`
+- `kpe_cache = kpe_cache.contiguous()`
+- `sparse_indices = sparse_indices.contiguous()`
+- Convert `sm_scale` to Python float using `.item()` if tensor.
+
+This prevents stride-related bugs and keeps pointer arithmetic valid.
+
+### Safety Valve 2: Tensor/device checks in C++ wrapper
+In the exposed C++ function, add deterministic checks:
+- CUDA device check for all tensors.
+- dtype checks:
+  - q/cache tensors are bf16,
+  - sparse indices are int32,
+  - sm_scale passed as double/float scalar.
+- shape checks matching fixed head counts and dimensions.
+
+Use `TORCH_CHECK` for all assumptions. This guarantees failure is explicit rather than a silent memory error.
+
+### Safety Valve 3: Invalid-index masking before load
+Every key iteration must follow this rule:
+1. Read `idx = sparse_indices[...]`.
+2. If `idx < 0`, skip all cache loads and treat score as absent.
+3. Only valid keys enter the online softmax update.
+
+This is the exact hard-constraint enforcement for padding positions.
+
+### Safety Valve 4: Zero-valid-key deterministic fallback
+If a `(token, head)` sees no valid sparse indices:
+- write zeros to all 512 output dims,
+- write `-FLT_MAX` to `lse`.
+
+This is deterministic, valid, and prevents divide-by-zero issues when `l == 0`.
+
+### Safety Valve 5: Optional runtime fallback to parent-like safe path
+If the Executor attempts a more aggressive compact merge and encounters compile instability, the code should retain a fallback internal path:
+- same one-block-per-(token,head) design,
+- same online softmax,
+- simpler shared-memory merge layout.
+
+This is not a separate Python fallback implementation; it is a deterministic backup kernel structure to ensure the child remains valid and compilable.
+
+---
+
+## Phase 4: Implementation Details
+
+### Python libraries to use
+Use only:
+- `torch`
+- `torch.utils.cpp_extension.load_inline`
+
+Do not introduce nonstandard packages.
+
+### C++/CUDA includes
+Use:
+- `#include <torch/extension.h>`
+- `#include <ATen/cuda/CUDAContext.h>`
+- `#include <cuda_runtime.h>`
+- `#include <cuda_bf16.h>`
+- `#include <float.h>`
+
+### Exact wrapper structure
+The code should keep the same external API:
+```python
+def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
+    ...
+    return output, lse
+```
+
+### CUDA implementation checklist
+1. Define constants:
+   - `NUM_HEADS = 16`
+   - `HEAD_DIM_CKV = 512`
+   - `HEAD_DIM_KPE = 64`
+   - `TOPK = 2048`
+   - `LOG2E = 1.4426950408889634f`
+
+2. Kernel launch geometry:
+   - `grid = dim3(num_tokens, NUM_HEADS)`
+   - `block = dim3(256)`
+
+3. Query loading:
+   - Load query bf16 vectors once per thread/lane.
+   - Convert to fp32 registers.
+
+4. Sparse-loop structure:
+   - Warp `w` handles keys `[w*256, (w+1)*256)`.
+   - Process keys in small unrolled chunks, e.g. 8 or 16, only if register pressure allows.
+   - Pre-read sparse indices into registers and compute validity mask.
+
+5. Dot-product path:
+   - Each lane computes partial dot for its 16 `ckv` dimensions and 2 `kpe` dimensions.
+   - Warp reduction by XOR shuffle.
+   - Lane 0 can hold the final scalar score, or all lanes can receive it after final shuffle.
+
+6. Online softmax path:
+   - Maintain `m`, `l`, and lane-owned `acc0`, `acc1` in fp32.
+   - Update only on valid keys.
+
+7. Warp-state merge:
+   - Store `m_w`, `l_w`, and two lane-owned output partials per warp into shared memory.
+   - Synchronize once.
+   - Each thread merges the 8 warp states for its own 2 dimensions.
+   - Thread 0 computes final `lse`.
+
+8. Output store:
+   - Normalize with `inv_l = 1.0f / l_blk` when `l_blk > 0`.
+   - Convert to bf16 using `__floats2bfloat162_rn`.
+   - Write exactly 2 output dims per thread.
+
+9. Module caching:
+   - Keep lazy singleton compilation with `_module is None`.
+   - Use a fresh module name versioned beyond parent.
+
+10. Compilation flags:
+   - `extra_cuda_cflags=["-O3", "--use_fast_math"]`
+   - No manual architecture flags.
+
+### Concrete child-edit priorities for Executor
+Implement changes in this order:
+1. Add `TORCH_CHECK` input validation in C++ wrapper.
+2. Replace parent’s `smem_acc[8][512]` pattern with compact lane-owned partial storage.
+3. Keep online softmax recurrence unchanged.
+4. Preserve base-2 LSE exactly.
+5. Benchmark compile-risky micro-optimizations only if they do not complicate correctness.
+
+---
+
+## Review Against Requirements
+
+### Does the plan rely on math rather than luck?
+Yes. The core is an exact mathematical online-softmax reduction, with deterministic invalid-index masking and exact block merge equations.
+
+### Library Check
+Yes. Only `torch` and `torch.utils.cpp_extension.load_inline` are used. No obscure packages.
+
+### Randomness Check
+No randomness is used, so no multi-start loop is required.
+
+### Is the code implementable?
+Yes. This is a direct modification of the current successful parent kernel, not a speculative redesign.
+
+### Does it decouple hard structure from easy tuning?
+Yes.
+- **Structure finding**: choose the kernel decomposition and merge layout.
+- **Parameter tuning**: preserve exact score and softmax equations while refining shared-memory/register scheduling.
+
+---
+
+## Final Instruction to Executor
+
+Build a child kernel that is **structurally conservative but reduction-layout aggressive**:
+- keep one fused block per `(token, head)`,
+- keep exact warp score computation and exact online softmax,
+- replace the parent’s large shared-memory accumulator merge with a compact lane-owned partial merge,
+- add explicit wrapper checks and deterministic zero-valid-key handling.
+
+This is the highest-robustness path to beat the already strong parent while maintaining correctness and compilation stability.
