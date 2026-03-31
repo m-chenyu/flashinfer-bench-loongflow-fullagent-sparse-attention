@@ -1,0 +1,49 @@
+### Final Child Solution Generation Plan
+
+**Objective:** Optimize the Sparse Attention (DSA) CUDA kernel to maximize throughput by reducing global memory redundancy, optimizing register usage for higher occupancy, and improving block-level reduction efficiency.
+
+**Selected Outline:** Shared Memory Query Caching & Register-Pressure-Aware Tiling
+
+**Rationale for Selection:**
+1.  **Redundancy Reduction**: Caching the Query ($Q$) in Shared Memory (SMem) eliminates 8x redundant global memory reads (one per warp).
+2.  **Occupancy Optimization**: The parent's chunk size of 16 indices consumes significant registers. Reducing this slightly (e.g., to 8) while maintaining ILP can improve occupancy and hide latency better.
+3.  **Memory Coalescing**: Ensuring `sparse_indices` are loaded into SMem once per warp/block ensures perfectly coalesced access to index data.
+
+**Best Plan:**
+
+1.  **Phase 1: Mathematical Definition & Memory Layout**
+    *   **Input Tensors**: $Q_{nope} (512), Q_{pe} (64), K_{ckv} (512), K_{kpe} (64)$.
+    *   **Computation**: Dot product $D_j = (Q_{nope} \cdot K_{ckv, j} + Q_{pe} \cdot K_{kpe, j}) 	imes 	ext{scale}$.
+    *   **Softmax**: $m_i = \max(D_j), P_j = \exp_2(D_j - m_i), L_i = \sum P_j, O_i = \sum (P_j 	imes K_{ckv, j}) / L_i$.
+    *   **LSE**: $LSE_i = m_i + \log_2(L_i)$.
+    *   **Parallelization**: Each CUDA block (256 threads) handles one $(token, head)$ pair. 8 warps per block each process $2048/8 = 256$ sparse indices.
+
+2.  **Phase 2: The Optimization Loop (Kernel Logic)**
+    *   **Step 1 (Q-Caching)**: All threads in the block cooperatively load $Q_{nope}$ and $Q_{pe}$ into `__shared__` memory. Total SMEM: $(512 + 64) 	imes 2 = 1152$ bytes.
+    *   **Step 2 (Local Initialization)**: Each thread initializes its local max $m$, sum $l$, and an accumulator array for the 16 elements of the 512-dim output it is responsible for.
+    *   **Step 3 (Chunked Processing)**:
+        *   Iterate through the 256 indices assigned to the warp in chunks of $C=8$.
+        *   Load 8 indices into registers. Mask invalid (`-1`).
+        *   For each valid index:
+            *   Load $K_{ckv}$ and $K_{kpe}$ using `float4` vectorized loads.
+            *   Compute dot product using `__bfloat1622float2` and float32 accumulation.
+            *   Update local $m, l$, and output accumulator using the standard online softmax update rule (with `exp2f`).
+    *   **Step 4 (Warp-Level Reduction)**: Use `__shfl_xor_sync` to sum the dot product across the 32 threads in the warp before the softmax update.
+
+3.  **Phase 3: The "Safety Valve" (Correctness & Stability)**
+    *   **Masking**: Explicitly check `index >= 0` for every KV pair.
+    *   **Numerical Stability**: Perform all intermediate softmax updates in `float32`. Use `exp2f` and `log2f` for base-2 calculations as required by the task.
+    *   **Hierarchical Block Reduction**: 
+        *   Store each warp's local $m, l, acc$ into SMem.
+        *   Use a parallel tree reduction (first warp reduces all results) to calculate the global $m_{glob}, l_{glob}$.
+        *   Normalize the accumulators by the global $LSE$ and write back as `bfloat16`.
+
+4.  **Phase 4: Implementation Details**
+    *   **Vectorization**: Use `reinterpret_cast<const float4*>` for 128-bit loads.
+    *   **Registers**: Use `#pragma unroll` to ensure the compiler optimizes the inner loops.
+    *   **Python Wrapper**: Maintain `.contiguous()` calls to ensure pointer arithmetic in CUDA is correct. Use `load_inline` with `-O3` and `--use_fast_math`.
+
+**Expected Performance Improvement:**
+*   Reduced GMem pressure from Q-caching.
+*   Better occupancy from tuned register usage (chunk size 8 vs 16).
+*   Faster final reduction via parallel tree-reduction instead of sequential SMem processing.

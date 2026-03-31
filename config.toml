@@ -1,0 +1,9 @@
+[solution]
+name = "my-team-dsa-sparse-attn-v1"                   # Customize before submitting
+definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
+author = "team-name"                                  # Customize before submitting
+
+[build]
+language = "python"                                    # python | triton | cuda
+entry_point = "main.py::run"
+destination_passing_style = false

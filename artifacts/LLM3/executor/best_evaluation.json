@@ -1,0 +1,28 @@
+{
+  "status": "success",
+  "summary": "Optimization successful! Speedup: 43.98x (ref: 2.438ms, kernel: 0.065ms)",
+  "score": 4.397657682714005,
+  "metrics": {
+    "correctness": 1.0,
+    "speedup": 43.97657682714005,
+    "exec_time_ms": 0.0654155129323835,
+    "baseline_time_ms": 2.4380647016608195,
+    "compile_time": 0.0,
+    "eval_time": 50.98575305938721
+  },
+  "artifacts": {
+    "eval_backend": "modal+flashinfer-bench",
+    "task_id": "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64",
+    "execution_time": "50.99s",
+    "kernel_latency_ms": "0.065ms",
+    "reference_latency_ms": "2.438ms",
+    "speedup": "43.98x",
+    "bench_stats": {
+      "reference_latency_ms": 2.4380647016608195,
+      "max_relative_error": 0.0826224759221077,
+      "max_absolute_error": 0.0078125,
+      "total_workloads": 23
+    },
+    "correctness_check": "Passed"
+  }
+}

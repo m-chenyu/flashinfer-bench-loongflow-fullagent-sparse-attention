@@ -1,0 +1,21 @@
+### Strategic Brief: Iteration Analysis
+
+**1. Executive Summary**
+This iteration was an incremental refinement because reducing the KV-index chunk size successfully lowered register pressure, performing slightly better than the parent despite failing to implement the planned shared memory query caching.
+
+**2. Data-Driven Findings (Facts ONLY)**
+*   **Sibling Rank:** 1 out of 1.
+*   **Score Delta:** From parent (3.946) to child (3.987) (+1.04%).
+*   **Key Change:** Reduced the inner-loop index chunk size from 16 to 8, halving the number of registers dedicated to KV-cache data prefetching (`ckv_as`, `ckv_bs`).
+*   **Core Metrics:** Kernel Latency: 0.071ms; Reference Latency: 2.538ms; Reported Speedup: 39.87x.
+
+**3. Strategic Analysis (The "So What?")**
+*   **Root Cause:** The outcome was due to the partial but effective execution of the Plan. While the Executor ignored the instruction to cache Queries ($Q$) in Shared Memory (SMem), the reduction in chunk size directly addressed the parent's primary bottleneck: register pressure. In a kernel with a 512-dimensional head, the accumulator and prefetched tiles consume the majority of the register file; moving from chunk-16 to chunk-8 likely improved occupancy or reduced spilling.
+*   **Key Insight:** Register-per-thread limits are the "hard ceiling" for high-dimensional kernels (head_dim=512). Aggressive unrolling or large tile sizes (like the parent's 16) can be counter-productive if they force a reduction in active warps per SM.
+*   **Identified Risk:** **Executor Divergence.** The implementation failed to follow the "Step 1 (Q-Caching)" part of the plan. This leaves significant "low-hanging fruit" optimization on the table, as each warp in the block is still redundantly fetching the same Query data from global memory.
+
+**4. Actionable Guidance (The "What's Next?")**
+*   **Recommend Fusion:** The current register-efficient chunking (8) must be fused with the *missed* SMem caching of the Query vector. Caching $Q$ once per block (instead of once per warp) will reduce global memory traffic for Query data by a factor of 8x.
+*   **Recommend Exploration:** Investigate the use of `cp.async` (on supported architectures) to load the KV-cache chunks. This would allow the thread to perform the dot-product calculations of chunk $N$ while chunk $N+1$ is being fetched, hiding global memory latency.
+*   **Recommend Exploration:** Apply `__launch_bounds__(256, 2)` or similar constraints to force the compiler to prioritize register allocation that supports higher occupancy, which is critical for this memory-bound workload.
+*   **Warn:** Avoid increasing the chunk size back to 16 or 32 without first transitioning to a more register-efficient accumulation strategy (e.g., half-precision accumulation or more aggressive register reuse).

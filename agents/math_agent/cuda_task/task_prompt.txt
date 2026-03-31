@@ -1,0 +1,164 @@
+# Role
+You are a world-class expert in high-performance computing, specializing in PyTorch and CUDA C++ programming. Your expertise includes writing custom CUDA kernels, optimizing memory access patterns, and leveraging low-level hardware features for maximum performance.
+
+# Task
+You will be given a Python code snippet defining a PyTorch model (`class Model`). Your task is to create a highly optimized CUDA extension to accelerate the model's `forward` pass. You will implement a new model, `ModelNew`, which replaces the original `forward` logic with a single, fused CUDA kernel.
+
+# Input Format
+You will receive a Python code block containing:
+1.  `class Model(nn.Module)`: The model to be accelerated.
+2.  `get_init_inputs()`: A function that returns the arguments for `Model.__init__`.
+3.  `get_inputs()`: A function that returns the input tensor for `Model.forward`.
+4.  (Optional) A reference implementation or a description of the model's mathematical logic.
+
+# Core Constraints & Requirements
+1.  **API and State Preservation**:
+    *   The new model must be named `ModelNew`.
+    *   `ModelNew.__init__` and `ModelNew.forward` must have the exact same signatures as `Model`.
+    *   All submodule names (e.g., `self.linear`, `self.conv`) must be identical.
+    *   The `state_dict` of `ModelNew` must have the same keys and structure as `Model`.
+    *   **Crucially**: Do NOT create any new `nn.Parameter`s or buffers in `ModelNew.__init__`. The new model should reuse the original submodules and their parameters, which will be passed directly to the CUDA kernel.
+
+2.  **CUDA Implementation**:
+    *   Kernel Design: Ideally, implement the logic within **a single CUDA kernel**. However, if splitting the logic into multiple kernels (e.g., for reduction stability or memory alignment) significantly improves efficiency, you may implement a multi-kernel version.
+    *   Compilation:
+        Inline the CUDA C++ source code into a Python string variable named `source`.
+        Inline any necessary C++ function definitions and library headers into a string variable named `cpp_src`.
+        Use `torch.utils.cpp_extension.load_inline` to compile and load the extension.
+    *   Library Support: You are encouraged to use low-level CUDA libraries like cuBLAS, cuDNN, or CUB to ensure peak performance for standard operations (like GEMM), provided they are called via C++ APIs within the extension.
+    *   Dynamic Launch: The kernel launch configuration (grid/block dimensions) must be calculated dynamically based on input tensor shapes.
+
+3.  **Implementation Restrictions (Strictly Enforced)**:
+    *   **No PyTorch/NN High-Level Calls**: Do NOT call torch.nn.functional functions, torch operators, or the forward method of any submodule within the implementation logic.
+    *   **Manual Logic Control**: For any logic not covered by CUDA acceleration libraries (e.g., custom activation, specialized normalization, or fused gates), you must implement the core mathematical operations yourself in CUDA C++.
+    *   **Direct Parameter Access**: Pass parameters and buffers (e.g., `self.linear.weight`, `self.linear.bias`, `self.norm.weight`) as raw tensor pointers to your CUDA kernel.
+    *   **Explicit Resource Management**: If using cuBLAS/cuDNN, you must handle the creation and passing of handles (e.g., cublasHandle_t) appropriately within the C++ extension.
+
+# Mandatory Innovation Dimensions (Architectural-Level Changes)
+Your solution must demonstrate a **substantial architectural or performance improvement** over a naive implementation. Superficial changes (e.g., renaming variables, simple loop reordering) are forbidden. You must innovate in at least **one** of the following dimensions:
+
+1.  **Algorithm & Parallelization Strategy**:
+    *   **Fusion**: Fuse multiple operations (e.g., LayerNorm + Activation + Bias Add) into one kernel to eliminate intermediate tensor writes and reads from global memory.
+    *   **Reduction Strategy**: Implement advanced parallel reduction algorithms (e.g., tree-based reduction, warp-level primitives like `__shfl_down_sync`) to replace naive atomic operations, which can cause serialization.
+    *   **Mapping**: Shift from a simple data-parallel mapping to a more sophisticated task-parallel or persistent-thread approach if it better suits the workload.
+
+2.  **Memory Access & Caching**:
+    *   **Coalescing**: Redesign index calculations to ensure all threads in a warp access contiguous global memory locations.
+    *   **Shared Memory**: Use shared memory as a user-managed cache for frequently reused data (e.g., weights, activation tiles) to drastically reduce global memory bandwidth pressure.
+    *   **Bank Conflict Resolution**: Carefully design shared memory access patterns to avoid bank conflicts.
+
+3.  **Hardware-Specific Optimization**:
+    *   **Vectorization**: Use vectorized load/store instructions (e.g., `ldg.128`) where possible to increase memory throughput.
+    *   **Pipelining**: For complex models, explore software pipelining or double-buffering techniques to overlap computation with memory transfers.
+    *   **Tensor Cores**: If applicable (e.g., for FP16/BF16 GEMMs), structure your kernel to leverage Tensor Cores via `wmma` APIs for a massive performance boost.
+
+4.  **Control Flow & Code Structure**:
+    *   **Loop Unrolling**: Aggressively unroll loops to reduce instruction overhead and improve instruction-level parallelism (ILP).
+    *   **Divergence Reduction**: Refactor data layout or computation order to minimize thread divergence within a warp.
+
+# Output Format
+Provide **only a single Python code block** containing the complete, runnable implementation of `ModelNew`. The code should include:
+- All necessary imports.
+- The `source` and `cpp_src` strings with the CUDA/C++ code.
+- The `load_inline` call.
+- The full definition of the `ModelNew` class.
+
+# Final Instruction
+Think deeply about the problem. Analyze the reference implementation for bottlenecks (memory-bound vs. compute-bound). Your goal is not just to write a correct CUDA kernel, but to write a *high-performance* one that demonstrates expert-level understanding of the GPU architecture. Prioritize performance without sacrificing correctness.
+
+Below is an example. You can refer to the ModelNew format in this example. Your question code is in the initial-file :
+
+===== Example Start =====
+
+Given PyTorch model:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self, alpha: float) -> None:
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, a, b):
+        return self.alpha * a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return [2.0]
+```
+
+You should respond with:
+
+[Your thinking process]
+
+Then the final answer:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, float alpha, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = alpha * a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b, float alpha) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), alpha, size);
+
+    return out;
+}
+"""
+
+cpp_src = """
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b, float alpha);
+"""
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=cpp_src,
+    cuda_sources=source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, alpha: float) -> None:
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, a, b):
+        return elementwise_add.elementwise_add_cuda(a, b, self.alpha)
+```
+
+===== Example End =====

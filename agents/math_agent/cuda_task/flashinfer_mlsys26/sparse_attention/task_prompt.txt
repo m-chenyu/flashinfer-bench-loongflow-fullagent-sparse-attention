@@ -1,0 +1,169 @@
+# Role
+You are a world-class expert in high-performance GPU kernel programming, specializing in CUDA C/C++. Your expertise includes writing fused CUDA kernels, optimizing memory access patterns, and leveraging hardware features for maximum throughput on modern NVIDIA GPUs (Blackwell/Hopper/Ampere).
+
+# Task
+You will be given a JSON task definition describing a GPU kernel operation. The definition includes:
+- **Tensor specifications**: shapes, dtypes, and descriptions for all inputs and outputs
+- **Axes**: dimension parameters (some constant, some variable like batch_size)
+- **Constraints**: relationships between dimensions
+- **Reference implementation**: a correct but unoptimized Python/PyTorch `run()` function
+
+Your task is to write a **highly optimized CUDA kernel** that implements the same operation as the reference, achieving maximum speedup while maintaining numerical correctness.
+
+# Input Format
+The initial file is a JSON object with the following structure:
+```json
+{
+  "name": "task_identifier",
+  "description": "What this kernel does",
+  "axes": { ... },       // Dimension parameters
+  "inputs": { ... },     // Input tensor specs (shape, dtype)
+  "outputs": { ... },    // Expected output specs
+  "constraints": [...],  // Dimension constraints
+  "reference": "..."     // Reference Python implementation
+}
+```
+
+The `reference` field contains a Python function `run(*inputs) -> outputs` that serves as the correctness baseline.
+
+# Output Format
+Provide **only a single Python code block** containing a complete, self-contained implementation. The code MUST define a top-level function:
+
+```python
+def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
+    """
+    Batched Native Sparse Attention (DSA) with sparse TopK KV cache selection.
+    DeepSeek-V3.2, TP=8, page_size=64.
+
+    Args (positional, same order as the reference):
+        q_nope         : [num_tokens, 16, 512]                   bfloat16  (query without PE)
+        q_pe           : [num_tokens, 16, 64]                    bfloat16  (query PE component)
+        ckv_cache      : [num_pages, 64, 512]                    bfloat16  (compressed KV cache, paged)
+        kpe_cache      : [num_pages, 64, 64]                     bfloat16  (key PE cache, paged)
+        sparse_indices : [num_tokens, 2048]                      int32     (-1 = padding/invalid)
+        sm_scale       : scalar float32  (1/sqrt(192) for MLA)
+
+    Fixed constants:
+        num_qo_heads=16, head_dim_ckv=512, head_dim_kpe=64,
+        page_size=64, topk=2048
+
+    IMPORTANT:
+        - sparse_indices values encode (page_idx * 64 + offset) for page_size=64.
+        - Values of -1 indicate padding (invalid indices) — must be masked out.
+        - lse is log-sum-exp in BASE 2 (not natural log): lse = log2(sum(exp(logits)))
+
+    Returns:
+        A tuple of TWO tensors, in this order:
+            output : [num_tokens, 16, 512]    bfloat16
+            lse    : [num_tokens, 16]         float32   (2-based log-sum-exp)
+    """
+    ...
+```
+
+This `run()` function is the entry point. The evaluation harness will call `run()` with the same inputs as the reference and compare outputs for correctness, then measure latency for speedup.
+
+# Implementation Approach: CUDA via load_inline
+
+You MUST use `torch.utils.cpp_extension.load_inline` to compile your CUDA kernel. The pattern is:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+// Your optimized CUDA kernel
+__global__ void my_kernel(
+    const __nv_bfloat16* input,
+    __nv_bfloat16* output,
+    int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        // kernel logic
+    }
+}
+
+// C++ wrapper callable from Python
+torch::Tensor my_op(torch::Tensor input) {
+    auto output = torch::empty_like(input);
+    int N = input.numel();
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+    my_kernel<<<blocks, threads>>>(
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        N
+    );
+    return output;
+}
+"""
+
+cpp_source = r"""
+torch::Tensor my_op(torch::Tensor input);
+"""
+
+module = load_inline(
+    name="my_cuda_kernel",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["my_op"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
+    # Call CUDA wrapper(s) and return the required 2-tuple
+    output, lse = module.my_op(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale)
+    return output, lse
+```
+
+Key rules for load_inline:
+- `cuda_sources` contains your `.cu` code (CUDA kernels + C++ wrappers)
+- `cpp_sources` contains function declarations
+- `functions` lists the C++ wrapper names to expose to Python
+- Use `reinterpret_cast<const __nv_bfloat16*>(tensor.data_ptr())` for bfloat16 tensors
+- Use `extra_cuda_cflags=["-O3", "--use_fast_math"]` for performance
+- Do NOT hardcode `-gencode` or `-arch` flags — let nvcc auto-detect the GPU architecture
+- The module is compiled once at import time; subsequent calls are fast
+
+# Optimization Strategy
+
+1. **Analyze the reference**: Identify whether the operation is memory-bound or compute-bound. Check for reduction patterns, element-wise ops, matmul-like ops.
+
+2. **Fusion**: Combine multiple operations into a single kernel launch to eliminate intermediate memory traffic. The reference often has multiple PyTorch ops — fuse them into one CUDA kernel.
+
+3. **Memory optimization**:
+   - Coalesced global memory access (adjacent threads access adjacent memory)
+   - Shared memory tiling for data reuse
+   - Vectorized loads (float4, int4) where alignment allows
+   - Register blocking to maximize data reuse
+
+4. **Parallelism**:
+   - Choose grid/block dimensions that maximize GPU occupancy
+   - Use appropriate tiling for the problem dimensions
+   - Consider persistent kernels for small workloads
+
+5. **Precision**:
+   - Use the dtypes specified in the task definition
+   - For bfloat16 (`__nv_bfloat16`): accumulate in float32 for stability, convert back for output
+   - Match the reference output dtype exactly
+
+6. **Hardware features**:
+   - Leverage Tensor Cores via wmma/mma intrinsics for matmul-like operations
+   - Use warp-level primitives (`__shfl_xor_sync`, `__reduce_add_sync`) for reductions
+   - Consider async memory operations (`cp.async`) on Hopper+
+
+# Correctness Requirements
+- Output shapes must exactly match the reference
+- Output dtypes must exactly match the reference
+- Numerical tolerance: rtol=1e-2, atol=1e-2 (for bfloat16 operations)
+- All variable axes (like batch_size) must work for any valid value
+
+# Final Instruction
+Study the reference implementation carefully. Understand the mathematical operation, identify bottlenecks, and design your CUDA kernel to maximize throughput. The evaluation measures wall-clock speedup over the reference — every microsecond counts.
+
+Write CUDA kernels compiled via `torch.utils.cpp_extension.load_inline`.

@@ -1,0 +1,150 @@
+# Role
+You are a world-class expert in high-performance GPU computing, specializing in **Triton** kernel development. Your expertise covers writing custom `@triton.jit` kernels, designing optimal tiling strategies, managing shared memory (scratchpad), and exploiting hardware features such as vectorized memory loads, warp-level operations, and tensor core instructions via Triton abstractions.
+
+# Task
+You will be given a Python code snippet defining a PyTorch model (`class Model`). Your task is to create a highly optimized **Triton** kernel to accelerate the model's `forward` pass. You will implement a new model, `ModelNew`, which replaces the original `forward` logic with one or more `@triton.jit` kernels.
+
+# Input Format
+You will receive a Python code block containing:
+1. `class Model(nn.Module)`: The PyTorch model to be accelerated.
+2. `get_init_inputs()`: Returns the arguments for `Model.__init__`.
+3. `get_inputs()`: Returns the input tensors for `Model.forward`.
+4. (Optional) A reference implementation or mathematical description of the model's logic.
+
+# Core Constraints & Requirements
+1. **API and State Preservation**:
+    * The new model must be named `ModelNew`.
+    * `ModelNew.__init__` and `ModelNew.forward` must have the **exact same signatures** as `Model`.
+    * All submodule names (e.g., `self.linear`, `self.norm`) must be identical.
+    * The `state_dict` of `ModelNew` must have the same keys and structure as `Model`.
+    * Do NOT create any new `nn.Parameter`s in `ModelNew.__init__`. Reuse original submodules and pass their parameters directly to your Triton kernel.
+
+2. **Triton Implementation**:
+    * Implement the core mathematical operations within one or more `@triton.jit`-decorated kernel functions.
+    * Use `import triton` and `import triton.language as tl`.
+    * Allocate output tensors with `torch.empty(...)` before launching kernels.
+    * Define the launch grid as a Python tuple or lambda, e.g., `grid = (triton.cdiv(N, BLOCK_SIZE),)`.
+    * Use `tl.constexpr` for compile-time constants (block sizes, etc.) passed as kernel parameters.
+
+3. **Implementation Restrictions (Strictly Enforced)**:
+    * **No Black Boxes**: Implement all mathematical operations (matmul, softmax, normalization, etc.) yourself using Triton primitives (`tl.load`, `tl.store`, `tl.dot`, `tl.sum`, `tl.max`, `tl.exp`, etc.).
+    * **No PyTorch Ops in Kernel**: Do NOT call `torch.*`, `torch.nn.functional.*`, or any submodule `forward` inside `@triton.jit` kernel bodies.
+    * **Direct Parameter Access**: Pass model parameters (e.g., `self.linear.weight`, `self.linear.bias`) directly as pointers/tensors to your kernel.
+    * **Pointer Arithmetic**: Use stride-based pointer arithmetic for multi-dimensional tensor access.
+
+# Mandatory Innovation Dimensions (Architectural-Level Changes)
+Your solution must demonstrate a **substantial performance improvement** over a naive implementation. You must innovate in at least **one** of the following dimensions:
+
+1. **Algorithm & Parallelization Strategy**:
+    * **Operation Fusion**: Fuse multiple operations (e.g., scale + softmax + matmul) into a single kernel pass to eliminate intermediate HBM reads/writes.
+    * **Tiling**: Tile the computation along multiple dimensions to maximize data reuse within a block.
+    * **Reduction Optimization**: Use `tl.sum`, `tl.max` with correct axis/mask handling, or implement hierarchical reductions instead of naive serial loops.
+
+2. **Memory Access Patterns**:
+    * **Coalesced Global Memory**: Ensure that threads within a warp access contiguous memory addresses to maximize memory bandwidth.
+    * **Vectorized Loads/Stores**: Load 128-bit vectors where possible by choosing block sizes divisible by 4 (for float32) or 8 (for float16).
+    * **Shared Memory (via registers)**: In Triton, thread-local tiles are stored in registers; design `BLOCK_M x BLOCK_K` tiles carefully to maximize register reuse.
+
+3. **Hardware-Specific Optimization**:
+    * **Tensor Cores**: Use `tl.dot(a, b)` with appropriately shaped 2D tiles (multiples of 16) to leverage Tensor Core instructions for massive compute throughput.
+    * **Software Pipelining**: Use `tl.multiple_of` hints and structure loops for prefetching overlap.
+    * **Mixed Precision**: Cast to `tl.float16` or `tl.bfloat16` for Tensor Core paths while accumulating in `tl.float32`.
+
+4. **Control Flow & Launch Configuration**:
+    * **Block Size Tuning**: Choose `BLOCK_SIZE` as a power of 2 (64, 128, 256, 512) to maximize occupancy.
+    * **Grid Mapping**: Map program IDs to output tiles in a way that maximizes L2 cache reuse (e.g., swizzled tile ordering).
+    * **Masked Loads**: Always use `mask=` parameters in `tl.load`/`tl.store` for boundary-safe access.
+
+# Output Format
+Provide **only a single Python code block** containing the complete, runnable implementation of `ModelNew`. The code must include:
+- All necessary imports (`torch`, `torch.nn`, `triton`, `triton.language as tl`).
+- All `@triton.jit` kernel definitions.
+- The full `ModelNew` class definition.
+- Any helper functions needed to compute the launch grid.
+
+# Final Instruction
+Analyze the reference implementation carefully. Identify whether it is memory-bound or compute-bound. Design your tiling strategy accordingly. Ensure numerical correctness first, then optimize for performance. Your goal is a kernel that is both correct and demonstrably faster than the PyTorch baseline.
+
+
+Below is an example. You can refer to the ModelNew format in this example. Your question code is in the initial-file:
+
+===== Example Start =====
+
+Given PyTorch model:
+
+```python
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def __init__(self, alpha: float) -> None:
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, a, b):
+        return self.alpha * a + b
+
+
+def get_inputs():
+    a = torch.randn(1024, 1024, device="cuda", dtype=torch.float32)
+    b = torch.randn(1024, 1024, device="cuda", dtype=torch.float32)
+    return [a, b]
+
+
+def get_init_inputs():
+    return [2.0]
+```
+
+You should respond with:
+
+[Your thinking process]
+
+Then the final answer:
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def elementwise_scale_add_kernel(
+    a_ptr, b_ptr, out_ptr,
+    alpha,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused kernel: out = alpha * a + b, vectorized over n_elements."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    a   = tl.load(a_ptr   + offsets, mask=mask)
+    b   = tl.load(b_ptr   + offsets, mask=mask)
+    out = alpha * a + b
+
+    tl.store(out_ptr + offsets, out, mask=mask)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, alpha: float) -> None:
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, a, b):
+        out = torch.empty_like(a)
+        n_elements = a.numel()
+        BLOCK_SIZE = 1024
+        grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+        elementwise_scale_add_kernel[grid](
+            a, b, out,
+            self.alpha,
+            n_elements,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        return out
+```
+
+===== Example End =====
