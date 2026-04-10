@@ -1,55 +1,61 @@
-## LoongFlow Full-Agent Bundle for Sparse Attention
+# Sparse Attention Submission V2
 
-This bundle is a trimmed submission package for the `dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64` task.
+This repository is prepared as a FlashInfer contest submission for
+`dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64`.
 
-It keeps three things only:
+The current submission payload is centered on a CUDA implementation exported
+through the PyTorch extension path:
 
-1. The core LoongFlow full-agent code needed to understand and run the math evolution agent.
-2. The task-specific sparse-attention prompt, config, evaluator, and initial JSON definition.
-3. The final autonomous iteration-20 artifacts for the three competing models:
-   - `gpt-5.4`
-   - `claude-sonnet-4-6`
-   - `gemini-3.1-pro-preview`
+- solution name: `ML Team-dsa-sparse-attn-v2`
+- build language: `cuda`
+- binding backend: `torch`
+- entry point: `kernel.cu::dsa_forward`
+- intended submission tag: `submission-v2`
 
-### What Was Removed
+## Submission Files
 
-- `.venv`
-- caches and `__pycache__`
-- unrelated task examples
-- unrelated FlashInfer tasks (`gdn_decode`, `gdn_prefill`, `moe`)
-- bulky raw output directories
-- temporary logs and repeated intermediate executor files
-- embedded API keys
+The files that matter for the current submission are:
 
-### Important Note
+- `config.toml`
+  Declares the solution metadata and build configuration used by evaluation.
+- `solution/cuda/kernel.cu`
+  Main CUDA implementation and exported `dsa_forward` symbol.
+- `solution/cuda/binding.py`
+  Auxiliary Python-side binding metadata included with the packed sources.
+- `scripts/pack_solution.py`
+  Packs the solution directory into `solution.json` for local validation.
 
-This bundle is organized around the final autonomous stage that produced the iteration-20 result artifacts.
-The original run resumed from an earlier checkpoint and then continued autonomously to iteration 20.
-To keep the package small, this bundle preserves the final iteration-20 artifacts rather than the full raw output tree.
+The previous Python solution path is no longer the active submission target.
+This repo now treats the CUDA implementation as the source of truth.
 
-If you need a fully replayable resume package from the exact prior checkpoint, you should additionally archive the corresponding upstream checkpoint/output tree from the original project.
+## Local Packaging
 
-### Key Paths
+To pack the current solution into `solution.json`:
 
-- Agent entrypoint:
-  `agents/math_agent/math_evolve_agent.py`
-- Sparse-attention task assets:
-  `agents/math_agent/cuda_task/flashinfer_mlsys26/sparse_attention/`
-- Final iteration-20 artifacts:
-  `artifacts/iter20/`
+```bash
+python3 scripts/pack_solution.py
+```
 
-### Best Scores in This Bundle
+This reads `config.toml`, collects the files under `solution/cuda/`, and
+produces a packed solution JSON at the repository root.
 
-- `gpt-5.4`: `43.98x`
-- `claude-sonnet-4-6`: `39.33x`
-- `gemini-3.1-pro-preview`: `39.87x`
+## Tagging Workflow
 
-### Config Handling
+For contest submission, create a git commit containing the CUDA submission
+files, then create and push a submission tag such as:
 
-The copied task config has been sanitized. Fill in your own API endpoint and key before running locally.
+```bash
+python3 /Users/machenyu01/.codex/skills/flashinfer-submission-tagger/scripts/tag_submission.py \
+  --repo /Users/machenyu01/Downloads/mlsys/flashinfer-bench-loongflow-fullagent-sparse-attention \
+  --tag submission-v2 --create --push
+```
 
-Recommended approach:
+The evaluator consumes the tagged commit by checking out the tag and reading
+`config.toml`.
 
-1. Copy `task_config.yaml` to a local untracked file if needed.
-2. Fill in your own credentials.
-3. Do not commit the filled credentials file.
+## Repository Context
+
+The repository still contains the supporting LoongFlow full-agent assets and
+historic artifacts used during autonomous search. They remain useful for
+reproducing context, but the active submission is the CUDA code under
+`solution/cuda/`.
