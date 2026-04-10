@@ -1,4 +1,4 @@
-// submission-v2
+// v2
 // CUDA sparse-attention implementation for
 // dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64.
 // Exported torch binding symbol: dsa_forward.

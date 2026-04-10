@@ -10,7 +10,7 @@ through the PyTorch extension path:
 - build language: `cuda`
 - binding backend: `torch`
 - entry point: `kernel.cu::dsa_forward`
-- intended submission tag: `submission-v2`
+- intended submission tag: `v2`
 
 ## Submission Files
 
@@ -42,12 +42,12 @@ produces a packed solution JSON at the repository root.
 ## Tagging Workflow
 
 For contest submission, create a git commit containing the CUDA submission
-files, then create and push a submission tag such as:
+files, then create and push a tag such as:
 
 ```bash
 python3 /Users/machenyu01/.codex/skills/flashinfer-submission-tagger/scripts/tag_submission.py \
   --repo /Users/machenyu01/Downloads/mlsys/flashinfer-bench-loongflow-fullagent-sparse-attention \
-  --tag submission-v2 --create --push
+  --tag v2 --create --push
 ```
 
 The evaluator consumes the tagged commit by checking out the tag and reading
@@ -55,7 +55,6 @@ The evaluator consumes the tagged commit by checking out the tag and reading
 
 ## Repository Context
 
-The repository still contains the supporting LoongFlow full-agent assets and
-historic artifacts used during autonomous search. They remain useful for
-reproducing context, but the active submission is the CUDA code under
-`solution/cuda/`.
+The repository still contains the supporting LoongFlow full-agent assets used
+to build and understand the sparse-attention workflow, but the active
+submission payload is the CUDA code under `solution/cuda/`.
